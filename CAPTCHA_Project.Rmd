@@ -1,0 +1,401 @@
+---
+title: "CAPTCHA"
+author: "Georgios Pnigouras"
+date: "2025-01-12"
+output: html_document
+
+---
+
+```{r}
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(purrr)
+
+# Set seed for reproducibility
+set.seed(1234)
+
+# Define the path to the CAPTCHA images directory
+data_dir <- "data/"
+
+# Get list of all image files
+image_files <- list.files(data_dir, pattern = "*.png", full.names = TRUE)
+cat("Number of images found: ", length(image_files), "\n")
+
+```
+
+
+```{r}
+processed_images <- map(image_files, function(img_path) {
+  # Load the image in grayscale
+  img <- image_load(img_path, grayscale = TRUE, target_size = c(50, 200))
+  
+  # Convert the image to an array and normalize
+  img_array <- image_to_array(img) / 255.0
+  
+  # Remove the extra dimension for grayscale
+  img_array <- drop(img_array)
+  
+  return(img_array)
+})
+```
+
+```{r}
+# Extract labels from filenames
+labels <- basename(image_files) %>%
+  str_remove_all("\\.png")
+
+# Get unique characters from labels
+characters <- c(letters, 0:9)
+cat("Number of unique characters: ", length(characters), "\n")
+cat("Characters: ", paste(characters, collapse = ", "), "\n")
+
+# Create a dataframe with image paths and labels
+dataset <- tibble(img_path = image_files, label = labels)
+
+# Split into training and validation datasets
+set.seed(1234)
+training_data <- dataset %>%
+  sample_frac(0.8)
+vt_data <- setdiff(dataset, training_data)
+validation_data <- vt_data %>%
+  sample_frac(0.5)
+testing_data <- setdiff(vt_data, validation_data)
+
+cat("Number of training samples: ", nrow(training_data), "\n")
+cat("Number of validation samples: ", nrow(validation_data), "\n")
+
+# Map characters to numeric labels
+char_to_labels <- setNames(0:(length(characters)-1), characters)
+labels_to_char <- setNames(characters, 0:(length(characters)-1))
+
+# Function to preprocess images and labels
+process_images <- function(data, img_height = 50, img_width = 200) {
+  # Ensure the input data is valid
+  if (!all(c("img_path", "label") %in% colnames(data))) {
+    stop("Input data must have columns 'img_path' and 'label'.")
+  }
+  
+  # Initialize variables
+  num_samples <- nrow(data)
+  images <- array(0, dim = c(num_samples, img_height, img_width, 1)) # Placeholder for image data
+  labels <- vector("list", num_samples) # Placeholder for labels
+  
+  # Loop through each row in the data
+  for (i in seq_len(num_samples)) {
+    # Load and process the image
+    img <- image_load(data$img_path[i], grayscale = TRUE, target_size = c(img_height, img_width))
+    img_array <- image_to_array(img) / 255.0 # Normalize pixel values
+    images[i, , , 1] <- drop(img_array) # Store in the array (drop unnecessary dimensions)
+    
+    # Process the label (split into characters and store as a vector)
+    labels[[i]] <- str_split(data$label[i], "")[[1]]
+  }
+  
+  # Return a list with processed images and labels
+  list(images = images, labels = labels)
+}
+
+# Generate training and validation datasets
+train_data <- process_images(training_data)
+valid_data <- process_images(validation_data)
+test_data <- process_images(testing_data)
+encode_label <- function(label, char_to_labels) {
+  map_int(label, ~ char_to_labels[.]) # Convert each character to its numeric value
+}
+
+# Add encoded_label to the train_data list
+train_data$encoded_label <- map(train_data$labels, ~ encode_label(.x, char_to_labels))
+valid_data$encoded_label <- map(valid_data$labels, ~ encode_label(.x, char_to_labels))
+test_data$encoded_label <- map(test_data$labels, ~ encode_label(.x, char_to_labels))
+```
+
+
+
+
+```{r}
+set.seed(1234)
+
+create_model <- function(num_classes, input_shape = c(50, 200, 1)) {
+  # Define L2 regularization to prevent overfitting
+  l2_reg <- regularizer_l2(0.0001) # L2 regularization with lambda = 0.0001
+  
+  # Define Input layer
+  input <- layer_input(shape = input_shape)
+  
+  # Convolutional and pooling layers
+  conv1 <- input %>%
+    layer_conv_2d(filters = 16, kernel_size = c(3, 3), padding = "same", 
+                  activation = "relu", kernel_regularizer = l2_reg) %>%
+    layer_max_pooling_2d(pool_size = c(2, 2), padding = "same") # Downsample to 25x100
+  
+  conv2 <- conv1 %>%
+    layer_conv_2d(filters = 32, kernel_size = c(3, 3), padding = "same", 
+                  activation = "relu", kernel_regularizer = l2_reg) %>%
+    layer_max_pooling_2d(pool_size = c(2, 2), padding = "same") # Downsample to 13x50
+  
+  conv3 <- conv2 %>%
+    layer_conv_2d(filters = 32, kernel_size = c(3, 3), padding = "same", 
+                  activation = "relu", kernel_regularizer = l2_reg) %>%
+    layer_batch_normalization() %>% # Batch normalization for better stability
+    layer_max_pooling_2d(pool_size = c(2, 2), padding = "same") # Downsample to 7x25
+  
+  # Flatten the layer to prepare for dense layers
+  flat <- conv3 %>% layer_flatten()
+  
+  # Multi-output architecture for 5 characters in CAPTCHA
+  outputs <- list()
+  for (i in 1:5) {
+    # Assign meaningful names to the outputs
+    output_name <- paste0("character_", i)
+    
+    # Each character is predicted independently
+    dense <- flat %>%
+      layer_dense(units = 128, activation = "relu", kernel_regularizer = l2_reg) %>%
+      layer_dropout(rate = 0.6) %>% # Dropout to reduce overfitting
+      layer_dense(units = num_classes, activation = "softmax", name = output_name) # Custom name
+    
+    outputs[[i]] <- dense
+  }
+  
+  # Compile the model
+  model <- keras_model(inputs = input, outputs = outputs)
+  model %>% compile(
+    optimizer = optimizer_adam(),
+    loss = rep("categorical_crossentropy", 5), # One loss for each character
+    metrics = c("accuracy")
+  )
+  
+  return(model)
+}
+
+
+# Updated prepare_data function to preprocess input
+prepare_data <- function(data, num_classes) {
+  x <- data$images # Shape: [batch_size, height, width, channels]
+  
+  # One-hot encode each character in the label
+  y <- lapply(data$encoded_label, function(label) {
+    lapply(label, function(char) {
+      to_categorical(char, num_classes = num_classes)
+    })
+  })
+  
+  # Combine the one-hot labels into a list for multi-output
+  y <- lapply(1:5, function(i) {
+    do.call(rbind, lapply(y, function(sample) sample[[i]]))
+  })
+  
+  list(x = x, y = y) # Return both the inputs (x) and one-hot encoded outputs (y)
+}
+
+# Prepare training, validation, and test data
+num_classes <- length(characters)
+
+train <- prepare_data(train_data, num_classes)
+valid <- prepare_data(valid_data, num_classes)
+test <- prepare_data(test_data, num_classes)
+
+# Create the model
+model <- create_model(num_classes)
+
+# Train the model
+history <- model %>% fit(
+  x = train$x,
+  y = train$y,
+  batch_size = 32,
+  epochs = 50,
+  validation_data = list(valid$x, valid$y)
+)
+
+
+# Function to plot metrics for each letter
+plot_metrics_per_output <- function(history, base_metric, title_base, ylabel) {
+  # Extract relevant metrics for each output
+  outputs <- c("character_1", "character_2", "character_3", "character_4", "character_5")
+  
+  # Iterate over each output
+  for (output in outputs) {
+    # Construct metric names for training and validation
+    train_metric <- history$metrics[[paste0(output, "_", base_metric)]]
+    val_metric <- history$metrics[[paste0("val_", output, "_", base_metric)]]
+    
+    # Check if the metrics exist
+    if (is.null(train_metric) || is.null(val_metric)) {
+      warning(paste("Metrics for", output, "not found. Skipping."))
+      next
+    }
+    
+    # Create epochs sequence
+    epochs <- seq_along(train_metric)
+    
+    # Plot the metrics
+    plot(epochs, train_metric, type = "l", col = "blue", lwd = 2,
+         xlab = "Epochs", ylab = ylabel, main = paste(title_base, output, "per Epoch"),
+         ylim = range(c(train_metric, val_metric), na.rm = TRUE))
+    lines(epochs, val_metric, col = "red", lwd = 2)
+    
+    legend("bottomright", legend = c("Training", "Validation"), col = c("blue", "red"), lwd = 2)
+    grid()
+  }
+}
+
+# Plot accuracy and loss for each output
+plot_metrics_per_output(history, "accuracy", "Model Accuracy for Output", "Accuracy")
+plot_metrics_per_output(history, "loss", "Model Loss for Output", "Loss")
+
+
+plot_metrics_per_output_combined <- function(history, base_metric, title_base, ylabel) {
+  # Extract relevant metrics for each output
+  outputs <- c("character_1", "character_2", "character_3", "character_4", "character_5")
+  
+  # Set up a 2x3 grid for the plots (leaving one empty if needed)
+  par(mfrow = c(2, 3)) # Adjust the grid layout as needed
+  
+  for (output in outputs) {
+    # Construct metric names for training and validation
+    train_metric <- history$metrics[[paste0(output, "_", base_metric)]]
+    val_metric <- history$metrics[[paste0("val_", output, "_", base_metric)]]
+    
+    # Check if the metrics exist
+    if (is.null(train_metric) || is.null(val_metric)) {
+      warning(paste("Metrics for", output, "not found. Skipping."))
+      next
+    }
+    
+    # Create epochs sequence
+    epochs <- seq_along(train_metric)
+    
+    # Plot the metrics
+    plot(epochs, train_metric, type = "l", col = "blue", lwd = 2,
+         xlab = "Epochs", ylab = ylabel, main = paste(title_base, output),
+         ylim = range(c(train_metric, val_metric), na.rm = TRUE))
+    lines(epochs, val_metric, col = "red", lwd = 2)
+    
+    legend("bottomright", legend = c("Training", "Validation"), col = c("blue", "red"), lwd = 2, cex = 0.8)
+    grid()
+  }
+  
+  # Reset par settings to default
+  par(mfrow = c(1, 1))
+}
+
+# Call the function to plot accuracy and loss
+plot_metrics_per_output_combined(history, "accuracy", "Accuracy for", "Accuracy")
+
+
+```
+
+```{r}
+set.seed(1234)
+
+evaluate_full_captcha_accuracy <- function(model, test_data) {
+  # Predict on test data
+  predictions <- model %>% predict(test_data$x)
+  
+  # Decode predictions into class indices (argmax)
+  decoded_predictions <- lapply(predictions, function(output) {
+    apply(output, 1, which.max) - 1 # Convert to zero-based indexing
+  })
+  
+  # Reconstruct the predicted CAPTCHA strings
+  predicted_captchas <- apply(do.call(cbind, decoded_predictions), 1, paste0, collapse = "")
+  
+  # Decode one-hot encoded true labels back to class indices
+  decoded_true <- lapply(test_data$y, function(label) {
+    apply(label, 1, which.max) - 1 # Convert one-hot to class indices
+  })
+  
+  # Reconstruct the true CAPTCHA strings
+  true_captchas <- apply(do.call(cbind, decoded_true), 1, paste0, collapse = "")
+  
+  # Compare predictions to ground truth
+  correct_predictions <- predicted_captchas == true_captchas
+  
+  # Calculate overall accuracy
+  overall_accuracy <- mean(correct_predictions)
+  
+  list(
+    accuracy = overall_accuracy,
+    predicted_captchas = predicted_captchas,
+    true_captchas = true_captchas,
+    correct_predictions = correct_predictions
+  )
+}
+
+# Evaluate the model on the test dataset
+test_results <- evaluate_full_captcha_accuracy(model, test)
+
+# Print the overall accuracy
+
+cat("Overall CAPTCHA recognition accuracy:", test_results$accuracy * 100, "%\n")
+
+
+
+```
+
+
+```{r}
+# Visualization 
+
+evaluate_and_display_results <- function(model, test_data) {
+  # Predict on test data
+  predictions <- model %>% predict(test_data$x)
+  
+  # Decode predictions into class indices (argmax)
+  decoded_predictions <- lapply(predictions, function(output) {
+    apply(output, 1, which.max) - 1 # Convert to zero-based indexing
+  })
+  
+  # Reconstruct the predicted CAPTCHA strings
+  predicted_captchas <- apply(do.call(cbind, decoded_predictions), 1, paste0, collapse = "")
+  
+  # Decode one-hot encoded true labels back to class indices
+  decoded_true <- lapply(test_data$y, function(label) {
+    apply(label, 1, which.max) - 1 # Convert one-hot to class indices
+  })
+  
+  # Reconstruct the true CAPTCHA strings
+  true_captchas <- apply(do.call(cbind, decoded_true), 1, paste0, collapse = "")
+  
+  # Display results for each sample
+  for (i in seq_along(predicted_captchas)) {
+    cat("Sample Index:  ", i, "\n")
+    cat("Predicted Word: ", predicted_captchas[i], "\n")
+    cat("Actual Word:    ", true_captchas[i], "\n")
+    cat("-----------------------------\n")
+  }
+  
+  # Calculate the ratio of correct predictions
+  correct_predictions <- predicted_captchas == true_captchas
+  ratio_correct <- sum(correct_predictions) / length(correct_predictions)
+  
+  # Print the overall ratio
+  cat("\nOverall Accuracy (Ratio of Identical Predicted to Actual):", ratio_correct * 100, "%\n")
+  
+  # Return all results as a data frame for further analysis
+  results <- data.frame(
+    Index = seq_along(predicted_captchas),
+    Predicted = predicted_captchas,
+    Actual = true_captchas,
+    Correct = correct_predictions
+  )
+  
+  return(results)
+}
+
+# Evaluate and display results
+results <- evaluate_and_display_results(model, test)
+
+# Optionally save results to a CSV file
+write.csv(results, "captcha_results.csv", row.names = FALSE)
+
+# View the results data frame
+head(results)
+
+
+
+```
