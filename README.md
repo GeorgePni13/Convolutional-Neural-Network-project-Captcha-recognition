@@ -16,5 +16,6 @@ Although this CAPTCHA format is outdated and not used in modern security, this p
 - CNN  
 - Machine Learning  
 - Captcha
-- Image Recognition  
+- Keras
+- TensorFlow  
 - R
